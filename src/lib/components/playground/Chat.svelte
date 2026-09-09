@@ -499,7 +499,7 @@
 									class=" bg-transparent border border-gray-100/30 dark:border-gray-850/30 rounded-lg py-1 px-2 -mx-0.5 text-sm outline-hidden w-full"
 									bind:value={selectedModelId}
 								>
-									{#each $models as model}
+									{#each $models.filter((m) => !(m?.info?.meta?.hidden ?? false)) as model}
 										<option value={model.id} class="bg-gray-50 dark:bg-gray-700"
 											>{model.name}</option
 										>

@@ -458,6 +458,15 @@ async def get_all_models(request, refresh: bool = False, user: UserModel = None)
     return models
 
 
+def is_model_hidden(model: dict) -> bool:
+    """Check the model's 'hidden' meta flag (set via Admin > Settings > Models > Hide).
+
+    Hidden models stay usable through the API but are excluded from Web UI
+    model pickers and from the arena's implicit (non-curated) model pools.
+    """
+    return bool(((model.get('info') or {}).get('meta') or {}).get('hidden', False))
+
+
 async def check_model_access(user, model, model_info=None, db=None):
     if model.get('arena'):
         meta = model.get('info', {}).get('meta', {})
