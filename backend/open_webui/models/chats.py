@@ -58,7 +58,21 @@ def chat_search_terms(text: str) -> list[str]:
     return list(dict.fromkeys(re.findall(r'[a-z0-9]+', text.lower())))
 
 
-def chat_search_message_content_match_sql(dialect_name: str, key: str) -> str:
+def chat_search_trgm_capable(text: str) -> bool:
+    # pg_trgm GIN indexes can only serve LIKE patterns containing a run of at
+    # least 3 word characters (shorter patterns, e.g. 2-char CJK terms, cannot
+    # use the index and must fall back to per-row evaluation).
+    return any(len(m.group(0)) >= 3 for m in re.finditer(r'[^\W_]+', text.lower()))
+
+
+def chat_search_message_content_match_sql(
+    dialect_name: str,
+    key: str,
+    table_branch: bool = True,
+    blob_branches: bool = True,
+    blob_trgm_prefilter: bool = False,
+    blob_inline_prefilter: bool = False,
+) -> str:
     if dialect_name == 'sqlite':
         return f"""
         (
@@ -76,8 +90,9 @@ def chat_search_message_content_match_sql(dialect_name: str, key: str) -> str:
         """
 
     if dialect_name == 'postgresql':
-        return f"""
-        (
+        conditions = []
+        if table_branch:
+            conditions.append(f"""
             EXISTS (
                 SELECT 1
                 FROM chat_message AS message
@@ -86,22 +101,85 @@ def chat_search_message_content_match_sql(dialect_name: str, key: str) -> str:
                 AND json_typeof(message.content) = 'string'
                 AND LOWER(message.content #>> '{{}}') LIKE '%' || :{key} || '%'
             )
-            OR EXISTS (
+            """)
+        if blob_branches:
+            history_exists = f"""EXISTS (
                 SELECT 1
                 FROM json_each(Chat.chat#>'{{history,messages}}') AS history_message
                 WHERE json_typeof(history_message.value->'content') = 'string'
                 AND LOWER(history_message.value->>'content') LIKE '%' || :{key} || '%'
-            )
-            OR EXISTS (
+            )"""
+            legacy_exists = f"""EXISTS (
                 SELECT 1
                 FROM json_array_elements(Chat.chat->'messages') AS legacy_message
                 WHERE json_typeof(legacy_message->'content') = 'string'
                 AND LOWER(legacy_message->>'content') LIKE '%' || :{key} || '%'
-            )
+            )"""
+            if blob_trgm_prefilter:
+                # The planner cannot use trigram indexes for the correlated
+                # per-element EXISTS conditions above and severely mis-costs
+                # TOAST detoasting of Chat.chat. Prefilter chat ids through an
+                # uncorrelated subquery over the chat_search_content column
+                # (extracted plain message text, maintained by trigger) using its
+                # trigram index, then confirm exactly per element on the
+                # surviving rows, preserving exact semantics.
+                blob_exists = f"""(
+                Chat.id IN (
+                    SELECT chat_search_prefilter.id
+                    FROM chat AS chat_search_prefilter
+                    WHERE LOWER(chat_search_prefilter.chat_search_content) LIKE '%' || :{key} || '%'
+                )
+                AND (
+                    {history_exists}
+                    OR {legacy_exists}
+                )
+            )"""
+                conditions.append(blob_exists)
+            elif blob_inline_prefilter:
+                # Same idea without the trigram index (short patterns the index
+                # cannot serve, e.g. 2-char CJK terms): check the small extracted
+                # text column per row first, confirm per element only on hits.
+                blob_exists = f"""(
+                LOWER(Chat.chat_search_content) LIKE '%' || :{key} || '%'
+                AND (
+                    {history_exists}
+                    OR {legacy_exists}
+                )
+            )"""
+                conditions.append(blob_exists)
+            else:
+                conditions.append(history_exists)
+                conditions.append(legacy_exists)
+        joined_conditions = '\n            OR '.join(conditions)
+        return f"""
+        (
+            {joined_conditions}
         )
         """
 
     raise NotImplementedError(f'Unsupported dialect: {dialect_name}')
+
+
+_CHAT_SEARCH_TRGM_INDEXES_AVAILABLE: bool | None = None
+
+
+async def chat_search_blob_trgm_indexes_available(session: AsyncSession) -> bool:
+    """
+    Whether the trigram indexes backing fast chat.chat JSON blob search exist.
+    They are not created by migrations (external optimization); the result is
+    cached per process. Without them the two-phase search is skipped entirely.
+    """
+    global _CHAT_SEARCH_TRGM_INDEXES_AVAILABLE
+    if _CHAT_SEARCH_TRGM_INDEXES_AVAILABLE is None:
+        result = await session.execute(
+            text("""
+                SELECT count(*) FROM pg_indexes
+                WHERE tablename = 'chat'
+                AND indexname IN ('chat_search_content_trgm_idx')
+            """)
+        )
+        _CHAT_SEARCH_TRGM_INDEXES_AVAILABLE = result.scalar() == 1
+    return _CHAT_SEARCH_TRGM_INDEXES_AVAILABLE
 
 
 def chat_list_order(sort_by: str = 'updated_at', sort_dir: str = 'desc', user_id: str | None = None):
@@ -2207,111 +2285,191 @@ class ChatTable:
             bind = await session.connection()
             dialect_name = bind.dialect.name
 
-            search_params = {}
-            exact_match_clause = None
+            if dialect_name not in ('sqlite', 'postgresql'):
+                raise NotImplementedError(f'Unsupported dialect: {dialect_name}')
+
+            content_values = {}
             if phrase_query:
-                exact_match_clause = or_(
-                    Chat.title.ilike(bindparam('phrase_title_key')),
-                    text(chat_search_message_content_match_sql(dialect_name, 'phrase_content_key')),
-                )
-                search_params.update(
-                    {
-                        'phrase_title_key': f'%{phrase_query}%',
-                        'phrase_content_key': phrase_query,
-                    }
-                )
-
-                term_clauses = []
+                content_values['phrase_content_key'] = phrase_query
                 for term_idx, term in enumerate(search_terms):
-                    title_key = f'term_title_key_{term_idx}'
-                    content_key = f'term_content_key_{term_idx}'
-                    term_clauses.append(
-                        or_(
-                            Chat.title.ilike(bindparam(title_key)),
-                            text(chat_search_message_content_match_sql(dialect_name, content_key)),
-                        )
+                    content_values[f'term_content_key_{term_idx}'] = term
+
+            def build_search_stmt(  # noqa: C901
+                content_match_sql, include_blob_branches, skip, limit, exclude_ids=None, blob_null_guard=True
+            ):
+                search_stmt = stmt
+                search_params = {}
+
+                exact_match_clause = None
+                if phrase_query:
+                    exact_match_clause = or_(
+                        Chat.title.ilike(bindparam('phrase_title_key')),
+                        text(content_match_sql('phrase_content_key')),
                     )
-                    search_params[title_key] = f'%{term}%'
-                    search_params[content_key] = term
+                    search_params['phrase_title_key'] = f'%{phrase_query}%'
+                    search_params['phrase_content_key'] = phrase_query
 
-                if term_clauses:
-                    stmt = stmt.filter(or_(exact_match_clause, and_(*term_clauses)))
-                else:
-                    stmt = stmt.filter(exact_match_clause)
+                    term_clauses = []
+                    # A single term identical to the phrase is already covered by
+                    # the exact-match clause; building it again only duplicates work.
+                    dedup_term_clauses = len(search_terms) == 1 and search_terms[0] == phrase_query
+                    if not dedup_term_clauses:
+                        for term_idx, term in enumerate(search_terms):
+                            title_key = f'term_title_key_{term_idx}'
+                            content_key = f'term_content_key_{term_idx}'
+                            term_clauses.append(
+                                or_(
+                                    Chat.title.ilike(bindparam(title_key)),
+                                    text(content_match_sql(content_key)),
+                                )
+                            )
+                            search_params[title_key] = f'%{term}%'
+                            search_params[content_key] = term
 
-            if dialect_name == 'sqlite':
-                # Check if there are any tags to filter
-                if 'none' in tag_ids:
-                    stmt = stmt.filter(
-                        text("""
+                    if term_clauses:
+                        search_stmt = search_stmt.filter(or_(exact_match_clause, and_(*term_clauses)))
+                    else:
+                        search_stmt = search_stmt.filter(exact_match_clause)
+
+                if dialect_name == 'sqlite':
+                    # Check if there are any tags to filter
+                    if 'none' in tag_ids:
+                        search_stmt = search_stmt.filter(
+                            text("""
                             NOT EXISTS (
                                 SELECT 1
                                 FROM json_each(Chat.meta, '$.tags') AS tag
                             )
                             """)
-                    )
-                elif tag_ids:
-                    stmt = stmt.filter(
-                        and_(
-                            *[
-                                text(f"""
+                        )
+                    elif tag_ids:
+                        search_stmt = search_stmt.filter(
+                            and_(
+                                *[
+                                    text(f"""
                                     EXISTS (
                                         SELECT 1
                                         FROM json_each(Chat.meta, '$.tags') AS tag
                                         WHERE tag.value = :tag_id_{tag_idx}
                                     )
                                     """).params(**{f'tag_id_{tag_idx}': tag_id})
-                                for tag_idx, tag_id in enumerate(tag_ids)
-                            ]
+                                    for tag_idx, tag_id in enumerate(tag_ids)
+                                ]
+                            )
                         )
-                    )
 
-            elif dialect_name == 'postgresql':
-                # Safety filter: JSON field must not contain \u0000
-                stmt = stmt.filter(text("Chat.chat::text NOT LIKE '%\\\\u0000%'"))
+                elif dialect_name == 'postgresql':
+                    # Safety filter: title must not contain actual null bytes
+                    search_stmt = search_stmt.filter(text("Chat.title::text NOT LIKE '%\\x00%'"))
 
-                # Safety filter: title must not contain actual null bytes
-                stmt = stmt.filter(text("Chat.title::text NOT LIKE '%\\x00%'"))
+                    if include_blob_branches and blob_null_guard:
+                        # Safety filter: JSON field must not contain \u0000.
+                        # Only needed when the chat.chat JSON blob branches run:
+                        # it detoasts every scanned row and dominates query time.
+                        search_stmt = search_stmt.filter(text("Chat.chat::text NOT LIKE '%\\\\u0000%'"))
 
-                if 'none' in tag_ids:
-                    stmt = stmt.filter(
-                        text("""
+                    if 'none' in tag_ids:
+                        search_stmt = search_stmt.filter(
+                            text("""
                             NOT EXISTS (
                                 SELECT 1
                                 FROM json_array_elements_text(Chat.meta->'tags') AS tag
                             )
                             """)
-                    )
-                elif tag_ids:
-                    stmt = stmt.filter(
-                        and_(
-                            *[
-                                text(f"""
+                        )
+                    elif tag_ids:
+                        search_stmt = search_stmt.filter(
+                            and_(
+                                *[
+                                    text(f"""
                                     EXISTS (
                                         SELECT 1
                                         FROM json_array_elements_text(Chat.meta->'tags') AS tag
                                         WHERE tag = :tag_id_{tag_idx}
                                     )
                                     """).params(**{f'tag_id_{tag_idx}': tag_id})
-                                for tag_idx, tag_id in enumerate(tag_ids)
-                            ]
+                                    for tag_idx, tag_id in enumerate(tag_ids)
+                                ]
+                            )
                         )
+
+                if exclude_ids:
+                    search_stmt = search_stmt.filter(~Chat.id.in_(exclude_ids))
+
+                if exact_match_clause is not None:
+                    search_stmt = search_stmt.order_by(
+                        case((exact_match_clause, 0), else_=1), Chat.updated_at.desc(), Chat.id
                     )
+                else:
+                    search_stmt = search_stmt.order_by(Chat.updated_at.desc(), Chat.id)
+
+                if search_params:
+                    search_stmt = search_stmt.params(**search_params)
+
+                # Perform pagination at the SQL level
+                return search_stmt.offset(skip).limit(limit)
+
+            use_two_phase = (
+                dialect_name == 'postgresql'
+                and skip == 0
+                and bool(phrase_query)
+                and await chat_search_blob_trgm_indexes_available(session)
+            )
+
+            if not use_two_phase:
+                search_stmt = build_search_stmt(
+                    lambda key: chat_search_message_content_match_sql(dialect_name, key),
+                    include_blob_branches=True,
+                    skip=skip,
+                    limit=limit,
+                )
+                result = await session.execute(search_stmt)
+                all_chats = result.scalars().all()
             else:
-                raise NotImplementedError(f'Unsupported dialect: {dialect_name}')
+                # Two-phase search (PostgreSQL): phase A only touches indexed
+                # columns (title, chat_message) and never detoasts the chat.chat
+                # JSON blobs. Phase B only runs when phase A underfills the page
+                # and prefilters blob candidates through the trigram indexes.
+                phase_a_stmt = build_search_stmt(
+                    lambda key: chat_search_message_content_match_sql(dialect_name, key, blob_branches=False),
+                    include_blob_branches=False,
+                    skip=0,
+                    limit=limit,
+                )
+                all_chats = list((await session.execute(phase_a_stmt)).scalars().all())
 
-            if exact_match_clause is not None:
-                stmt = stmt.order_by(case((exact_match_clause, 0), else_=1), Chat.updated_at.desc(), Chat.id)
-            else:
-                stmt = stmt.order_by(Chat.updated_at.desc(), Chat.id)
+                if len(all_chats) < limit:
 
-            if search_params:
-                stmt = stmt.params(**search_params)
+                    def blob_content_match(key):
+                        trgm_capable = chat_search_trgm_capable(content_values[key])
+                        return chat_search_message_content_match_sql(
+                            dialect_name,
+                            key,
+                            table_branch=False,
+                            blob_trgm_prefilter=trgm_capable,
+                            blob_inline_prefilter=not trgm_capable,
+                        )
 
-            # Perform pagination at the SQL level
-            stmt = stmt.offset(skip).limit(limit)
-            result = await session.execute(stmt)
-            all_chats = result.scalars().all()
+                    needs_prefilter = any(chat_search_trgm_capable(value) for value in content_values.values())
+                    if needs_prefilter:
+                        # Force index usage for the prefilter subqueries: the
+                        # planner mis-costs TOAST detoasting and would otherwise
+                        # seq-scan the chat table. Transaction-local only.
+                        await session.execute(text('SET LOCAL enable_seqscan = off'))
+                    try:
+                        phase_b_stmt = build_search_stmt(
+                            blob_content_match,
+                            include_blob_branches=True,
+                            skip=0,
+                            limit=limit - len(all_chats),
+                            exclude_ids=[chat.id for chat in all_chats],
+                            blob_null_guard=False,
+                        )
+                        blob_chats = (await session.execute(phase_b_stmt)).scalars().all()
+                        all_chats.extend(blob_chats)
+                    finally:
+                        if needs_prefilter:
+                            await session.execute(text('SET LOCAL enable_seqscan = on'))
 
             log.info('The number of chats: %s', len(all_chats))
 
