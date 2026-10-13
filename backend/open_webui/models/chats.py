@@ -2210,117 +2210,161 @@ class ChatTable:
             bind = await session.connection()
             dialect_name = bind.dialect.name
 
-            search_params = {}
-            exact_match_clause = None
-            if phrase_query:
-                exact_match_clause = or_(
-                    Chat.title.ilike(bindparam('phrase_title_key')),
-                    text(chat_search_message_content_match_sql(dialect_name, 'phrase_content_key')),
-                )
-                search_params.update(
-                    {
-                        'phrase_title_key': f'%{phrase_query}%',
-                        'phrase_content_key': phrase_query,
-                    }
-                )
+            if dialect_name not in ('sqlite', 'postgresql'):
+                raise NotImplementedError(f'Unsupported dialect: {dialect_name}')
 
-                term_clauses = []
-                for term_idx, term in enumerate(search_terms):
-                    title_key = f'term_title_key_{term_idx}'
-                    content_key = f'term_content_key_{term_idx}'
-                    term_clauses.append(
-                        or_(
-                            Chat.title.ilike(bindparam(title_key)),
-                            text(chat_search_message_content_match_sql(dialect_name, content_key)),
-                        )
+            def build_search_stmt(content_match_sql, skip, limit, exclude_ids=None, blob_null_guard=True):
+                search_stmt = stmt
+                search_params = {}
+
+                exact_match_clause = None
+                if phrase_query:
+                    exact_match_clause = or_(
+                        Chat.title.ilike(bindparam('phrase_title_key')),
+                        text(content_match_sql('phrase_content_key')),
                     )
-                    search_params[title_key] = f'%{term}%'
-                    search_params[content_key] = term
+                    search_params.update(
+                        {
+                            'phrase_title_key': f'%{phrase_query}%',
+                            'phrase_content_key': phrase_query,
+                        }
+                    )
 
-                if term_clauses:
-                    stmt = stmt.filter(or_(exact_match_clause, and_(*term_clauses)))
-                else:
-                    stmt = stmt.filter(exact_match_clause)
+                    term_clauses = []
+                    for term_idx, term in enumerate(search_terms):
+                        title_key = f'term_title_key_{term_idx}'
+                        content_key = f'term_content_key_{term_idx}'
+                        term_clauses.append(
+                            or_(
+                                Chat.title.ilike(bindparam(title_key)),
+                                text(content_match_sql(content_key)),
+                            )
+                        )
+                        search_params[title_key] = f'%{term}%'
+                        search_params[content_key] = term
 
-            if dialect_name == 'sqlite':
-                # Check if there are any tags to filter
-                if 'none' in tag_ids:
-                    stmt = stmt.filter(
-                        text("""
+                    if term_clauses:
+                        search_stmt = search_stmt.filter(or_(exact_match_clause, and_(*term_clauses)))
+                    else:
+                        search_stmt = search_stmt.filter(exact_match_clause)
+
+                if dialect_name == 'sqlite':
+                    # Check if there are any tags to filter
+                    if 'none' in tag_ids:
+                        search_stmt = search_stmt.filter(
+                            text("""
                             NOT EXISTS (
                                 SELECT 1
                                 FROM json_each(Chat.meta, '$.tags') AS tag
                             )
                             """)
-                    )
-                elif tag_ids:
-                    stmt = stmt.filter(
-                        and_(
-                            *[
-                                text(f"""
+                        )
+                    elif tag_ids:
+                        search_stmt = search_stmt.filter(
+                            and_(
+                                *[
+                                    text(f"""
                                     EXISTS (
                                         SELECT 1
                                         FROM json_each(Chat.meta, '$.tags') AS tag
                                         WHERE tag.value = :tag_id_{tag_idx}
                                     )
                                     """).params(**{f'tag_id_{tag_idx}': tag_id})
-                                for tag_idx, tag_id in enumerate(tag_ids)
-                            ]
+                                    for tag_idx, tag_id in enumerate(tag_ids)
+                                ]
+                            )
                         )
-                    )
 
-            elif dialect_name == 'postgresql':
-                # Safety filter: JSON field must not contain \u0000
-                stmt = stmt.filter(text("Chat.chat::text NOT LIKE '%\\\\u0000%'"))
+                elif dialect_name == 'postgresql':
+                    # Safety filter: JSON field must not contain \u0000.
+                    # Only needed when the chat.chat JSON blob branches run:
+                    # it detoasts every scanned row and dominates query time.
+                    if blob_null_guard:
+                        search_stmt = search_stmt.filter(text("Chat.chat::text NOT LIKE '%\\\\u0000%'"))
 
-                # Safety filter: title must not contain actual null bytes
-                stmt = stmt.filter(text("Chat.title::text NOT LIKE '%\\x00%'"))
+                    # Safety filter: title must not contain actual null bytes
+                    search_stmt = search_stmt.filter(text("Chat.title::text NOT LIKE '%\\x00%'"))
 
-                if 'none' in tag_ids:
-                    stmt = stmt.filter(
-                        text("""
+                    if 'none' in tag_ids:
+                        search_stmt = search_stmt.filter(
+                            text("""
                             NOT EXISTS (
                                 SELECT 1
                                 FROM json_array_elements_text(Chat.meta->'tags') AS tag
                             )
                             """)
-                    )
-                elif tag_ids:
-                    stmt = stmt.filter(
-                        and_(
-                            *[
-                                text(f"""
+                        )
+                    elif tag_ids:
+                        search_stmt = search_stmt.filter(
+                            and_(
+                                *[
+                                    text(f"""
                                     EXISTS (
                                         SELECT 1
                                         FROM json_array_elements_text(Chat.meta->'tags') AS tag
                                         WHERE tag = :tag_id_{tag_idx}
                                     )
                                     """).params(**{f'tag_id_{tag_idx}': tag_id})
-                                for tag_idx, tag_id in enumerate(tag_ids)
-                            ]
+                                    for tag_idx, tag_id in enumerate(tag_ids)
+                                ]
+                            )
                         )
+
+                if exclude_ids:
+                    search_stmt = search_stmt.filter(~Chat.id.in_(exclude_ids))
+
+                if exact_match_clause is not None:
+                    search_stmt = search_stmt.order_by(
+                        case((exact_match_clause, 0), else_=1), Chat.updated_at.desc(), Chat.id
                     )
+                else:
+                    search_stmt = search_stmt.order_by(Chat.updated_at.desc(), Chat.id)
+
+                if search_params:
+                    search_stmt = search_stmt.params(**search_params)
+
+                # Perform pagination at the SQL level
+                return search_stmt.offset(skip).limit(limit)
+
+            # On PostgreSQL, first search only the indexed columns (title and the
+            # chat_message table), skipping the chat.chat JSON blob branches that
+            # force TOAST detoasting. The blob is searched in a fallback query
+            # only if the primary query underfills the page, e.g. for content that
+            # exists solely in the blob of older or imported chats. Identical
+            # results, dramatically less I/O in the common case.
+            use_fallback = dialect_name == 'postgresql' and skip == 0 and bool(phrase_query)
+
+            if not use_fallback:
+                search_stmt = build_search_stmt(
+                    lambda key: chat_search_message_content_match_sql(dialect_name, key),
+                    skip=skip,
+                    limit=limit,
+                )
+                result = await session.execute(search_stmt)
+                all_chats = result.scalars().all()
             else:
-                raise NotImplementedError(f'Unsupported dialect: {dialect_name}')
+                primary_stmt = build_search_stmt(
+                    lambda key: chat_search_message_content_match_sql(dialect_name, key, blob_branches=False),
+                    skip=0,
+                    limit=limit,
+                    blob_null_guard=False,
+                )
+                all_chats = list((await session.execute(primary_stmt)).scalars().all())
 
-            if exact_match_clause is not None:
-                stmt = stmt.order_by(case((exact_match_clause, 0), else_=1), Chat.updated_at.desc(), Chat.id)
-            else:
-                stmt = stmt.order_by(Chat.updated_at.desc(), Chat.id)
-
-            if search_params:
-                stmt = stmt.params(**search_params)
-
-            # Perform pagination at the SQL level
-            stmt = stmt.offset(skip).limit(limit)
-            result = await session.execute(stmt)
-            all_chats = result.scalars().all()
+                if len(all_chats) < limit:
+                    fallback_stmt = build_search_stmt(
+                        lambda key: chat_search_message_content_match_sql(dialect_name, key),
+                        skip=0,
+                        limit=limit - len(all_chats),
+                        exclude_ids=[chat.id for chat in all_chats],
+                    )
+                    fallback_chats = (await session.execute(fallback_stmt)).scalars().all()
+                    all_chats.extend(fallback_chats)
 
             log.info('The number of chats: %s', len(all_chats))
 
             # Validate and return chats
             return [ChatModel.model_validate(chat) for chat in all_chats]
-
     async def get_chats_by_folder_id_and_user_id(
         self,
         folder_id: str,
